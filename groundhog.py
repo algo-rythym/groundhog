@@ -10,6 +10,9 @@ A self-retrying code generation tool that:
   6. Assembles all passing chunks into one final file
   7. Streams live status updates to OpenWebUI throughout
 
+Uses whatever model the current chat is using — no separate Ollama config needed.
+OpenWebUI injects __user__ automatically, which contains the model and API key.
+
 Docker container per run:
   - python:3.11-slim image
   - --rm (auto-deleted after run)
@@ -27,12 +30,10 @@ import os
 import subprocess
 import sys
 import tempfile
-from typing import Callable, Awaitable
+from typing import Optional
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-OLLAMA_URL   = "http://localhost:11434/api/generate"
-MODEL        = "llama3.2"        # ← change to your Ollama model name
 MAX_RETRIES  = 6                 # retry attempts per subtask before giving up
 EXEC_TIMEOUT = 30                # seconds before killing the container
 DOCKER_IMAGE = "python:3.11-slim"
@@ -185,22 +186,36 @@ def _run_in_docker(code: str, timeout: int = EXEC_TIMEOUT) -> dict:
 
 # ── CODE HELPERS ──────────────────────────────────────────────────────────────
 
-def _call_model(prompt: str) -> str:
-    """Call local Ollama synchronously."""
+def _call_model(prompt: str, __user__: dict) -> str:
+    """
+    Call the same model the current chat is using via OpenWebUI's own API.
+    No hardcoded model name, no separate Ollama URL needed.
+    OpenWebUI injects __user__ which contains the model id and bearer token.
+    """
     try:
         import urllib.request
+
+        model   = __user__.get("model", "")
+        api_url = __user__.get("api_base_url", "http://localhost:8080")
+        token   = __user__.get("token", "")
+
         data = json.dumps({
-            "model": MODEL,
-            "prompt": prompt,
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
             "stream": False
         }).encode()
+
         req = urllib.request.Request(
-            OLLAMA_URL,
+            f"{api_url}/api/chat",
             data=data,
-            headers={"Content-Type": "application/json"}
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}"
+            }
         )
         with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.loads(resp.read()).get("response", "").strip()
+            result = json.loads(resp.read())
+            return result["choices"][0]["message"]["content"].strip()
     except Exception as e:
         return f"ERROR calling model: {e}"
 
@@ -235,12 +250,7 @@ class Tools:
 
     # ── Emitter ───────────────────────────────────────────────────────────
 
-    async def _emit(
-        self,
-        emitter: Callable[[dict], Awaitable[None]],
-        msg: str,
-        done: bool = False
-    ):
+    async def _emit(self, emitter, msg: str, done: bool = False):
         if emitter:
             await emitter({
                 "type": "status",
@@ -258,20 +268,22 @@ class Tools:
             self._image_ready = True
             return True
 
-        await self._emit(emitter, f"📦 Docker image not found locally. Pulling {DOCKER_IMAGE}...")
+        await self._emit(emitter, f"📦 Docker image not found. Pulling {DOCKER_IMAGE}...")
         success, err = _pull_image()
 
         if success:
             self._image_ready = True
-            await self._emit(emitter, f"✅ Docker image ready.")
+            await self._emit(emitter, "✅ Docker image ready.")
             return True
         else:
             await self._emit(emitter, f"❌ Failed to pull Docker image: {err}", done=True)
             return False
 
     # ── LLM calls ─────────────────────────────────────────────────────────
+    # __user__ is injected by OpenWebUI and contains the current model id
+    # and auth token — so these calls use whatever model the chat is using.
 
-    def _plan(self, task: str) -> list[str]:
+    def _plan(self, task: str, __user__: dict) -> list[str]:
         """Break task into small ordered subtasks — one function/class each."""
         prompt = f"""You are a software architect planning a Python project.
 
@@ -285,7 +297,7 @@ Example: ["Write parse_input(text) function", "Write validate_data(data) functio
 
 JSON array:"""
 
-        raw = _call_model(prompt)
+        raw = _call_model(prompt, __user__)
         try:
             start = raw.index("[")
             end   = raw.rindex("]") + 1
@@ -296,7 +308,7 @@ JSON array:"""
             pass
         return [task]  # fallback
 
-    def _write_chunk(self, task: str, subtask: str, context: str, error_context: str) -> str:
+    def _write_chunk(self, task: str, subtask: str, context: str, error_context: str, __user__: dict) -> str:
         """Ask the model to write ONE function or class for a subtask."""
         error_section = ""
         if error_context:
@@ -316,9 +328,9 @@ Your task now: {subtask}{error_section}
 
 Python code:"""
 
-        return _call_model(prompt)
+        return _call_model(prompt, __user__)
 
-    def _judge(self, subtask: str, code: str, output: str) -> tuple[bool, str]:
+    def _judge(self, subtask: str, code: str, output: str, __user__: dict) -> tuple[bool, str]:
         """Quick LLM quality check — kept tiny for 3B model reliability."""
         prompt = f"""Does this Python code correctly implement the task?
 
@@ -330,12 +342,12 @@ Execution output: {output[:400] if output else "(no output — code ran silently
 Reply PASS or FAIL and one short reason.
 Example: "PASS - function returns correct result"
 """
-        verdict = _call_model(prompt)
+        verdict = _call_model(prompt, __user__)
         passed  = "PASS" in verdict.upper()
         reason  = verdict.strip()[:200]
         return passed, reason
 
-    def _assemble(self, task: str, chunks: list[str]) -> str:
+    def _assemble(self, task: str, chunks: list[str], __user__: dict) -> str:
         """Stitch all chunks into one clean final Python file."""
         separator  = "\n" + ("=" * 50) + "\n"
         all_chunks = separator.join(chunks)
@@ -355,18 +367,20 @@ Chunks:
 
 Final combined Python file:"""
 
-        return _call_model(prompt)
+        return _call_model(prompt, __user__)
 
     # ── Public tool entry point ────────────────────────────────────────────
 
     async def build_code(
         self,
         task: str,
-        __event_emitter__: Callable[[dict], Awaitable[None]] = None
+        __user__: dict = {},
+        __event_emitter__: Optional[object] = None
     ) -> str:
         """
         Build complex Python code using a plan → chunk → test → retry loop.
 
+        Uses whatever model the current chat is running — no config needed.
         Each chunk is executed inside a Docker container. Pip packages are
         detected automatically from imports and installed inside the container.
         The container is deleted after every run.
@@ -383,11 +397,11 @@ Final combined Python file:"""
 
         # ── PHASE 1: PLAN ─────────────────────────────────────────────────
         await emit("🧠 Planning subtasks...")
-        subtasks = self._plan(task)
+        subtasks = self._plan(task, __user__)
         await emit(f"📋 {len(subtasks)} subtask(s) planned")
 
         # ── PHASE 2: BUILD EACH CHUNK ─────────────────────────────────────
-        built_chunks   = []
+        built_chunks    = []
         context_summary = ""
 
         for i, subtask in enumerate(subtasks):
@@ -402,8 +416,7 @@ Final combined Python file:"""
                 attempt += 1
                 await emit(f"  ✏️  Writing — attempt {attempt}/{self.max_retries}...")
 
-                # Write
-                code = self._write_chunk(task, subtask, context_summary, error_context)
+                code = self._write_chunk(task, subtask, context_summary, error_context, __user__)
 
                 # Syntax check — free, instant, no Docker needed
                 syntax_ok, code_or_err = _syntax_check(code)
@@ -414,30 +427,27 @@ Final combined Python file:"""
 
                 clean_code = code_or_err
 
-                # Show what packages will be installed if any
                 pkgs = _extract_imports(clean_code)
                 if pkgs:
                     await emit(f"  📦 Detected packages: {', '.join(pkgs)}")
 
-                # Spin up Docker container
-                await emit(f"  🐳 Creating Docker container...")
+                await emit("  🐳 Creating Docker container...")
                 run = _run_in_docker(clean_code)
 
                 if pkgs:
-                    await emit(f"  ⬇️  Installing packages inside container...")
+                    await emit("  ⬇️  Installing packages inside container...")
 
                 if not run["success"]:
                     error_context = (run["error"] or run["output"])
                     short_err     = error_context[:150].replace("\n", " ")
                     await emit(f"  ❌ Attempt {attempt} failed: {short_err}")
-                    await emit(f"  🗑️  Container removed")
+                    await emit("  🗑️  Container removed")
                     continue
 
-                await emit(f"  🗑️  Container removed")
+                await emit("  🗑️  Container removed")
 
-                # Judge
-                await emit(f"  🔍 Judging output...")
-                passed, reason = self._judge(subtask, clean_code, run["output"])
+                await emit("  🔍 Judging output...")
+                passed, reason = self._judge(subtask, clean_code, run["output"], __user__)
 
                 if passed:
                     built_chunks.append(clean_code)
@@ -460,7 +470,7 @@ Final combined Python file:"""
         # ── PHASE 3: ASSEMBLE ─────────────────────────────────────────────
         await emit("🔗 Assembling final file...")
 
-        final_code = self._assemble(task, built_chunks) if len(built_chunks) > 1 else built_chunks[0]
+        final_code = self._assemble(task, built_chunks, __user__) if len(built_chunks) > 1 else built_chunks[0]
 
         syntax_ok, result = _syntax_check(final_code)
 
@@ -482,7 +492,7 @@ Final combined Python file:"""
             output_note = ""
             if final_run["output"].strip():
                 preview = final_run["output"].strip()[:300]
-                output_note = f"\n\n# --- Test run output ---\n# " + preview.replace("\n", "\n# ")
+                output_note = "\n\n# --- Test run output ---\n# " + preview.replace("\n", "\n# ")
             return f"```python\n{result}{output_note}\n```"
 
         else:
